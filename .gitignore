@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environments and build output
+.venv/
+venv/
+env/
+build/
+dist/
+*.spec.bak
+
+# macOS
+.DS_Store
+
+# Generated documents and installers
+*.djv
+*.djvu
+*.pdf
+*.dmg
+*.app/
+
+# Keep the fixture directory available without publishing user documents.
+tests/fixtures/*
+!tests/fixtures/.gitkeep
