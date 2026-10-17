@@ -41,6 +41,8 @@ class PageInspection:
 _COLOR_DATA_CHUNKS = frozenset({"BG44", "FG44", "FGbz", "PM44"})
 _MIN_MEAN_CHROMA = 1.0
 _MIN_CHROMATIC_FRACTION = 0.005
+_BACKGROUND_TONE_RANGE = range(40, 221)
+_MAX_SIMPLE_BACKGROUND_TONE_FRACTION = 0.10
 
 
 def inspect_document(
@@ -71,6 +73,7 @@ def inspect_document(
 
     with tempfile.TemporaryDirectory(prefix="djvu2pdf-inspect-") as temporary:
         thumbnail_path = Path(temporary) / "thumbnail.ppm"
+        background_path = Path(temporary) / "background.pgm"
         inspected: list[PageInspection] = []
         for page_number, page in enumerate(pages, start=1):
             cancellation.check()
@@ -95,6 +98,24 @@ def inspect_document(
                     page_type, mean_chroma, chromatic_fraction = (
                         classify_thumbnail(image)
                     )
+                if page_type is PageType.GRAYSCALE:
+                    background_path.unlink(missing_ok=True)
+                    cancellation.run(
+                        [
+                            str(tools.ddjvu),
+                            "-format=pgm",
+                            "-mode=background",
+                            f"-page={page_number}",
+                            "-size=150x200",
+                            str(input_path),
+                            str(background_path),
+                        ],
+                        f"анализ фона страницы {page_number}",
+                        cwd=str(input_path.parent),
+                    )
+                    with Image.open(background_path) as background:
+                        if not background_requires_grayscale(background):
+                            page_type = PageType.MONOCHROME
             except OSError as error:
                 raise RuntimeError(
                     f"Не удалось проверить цвет страницы {page_number}: {error}"
@@ -133,6 +154,16 @@ def classify_thumbnail(image: Image.Image) -> tuple[PageType, float, float]:
         else PageType.GRAYSCALE
     )
     return page_type, mean_chroma, chromatic_fraction
+
+
+def background_requires_grayscale(image: Image.Image) -> bool:
+    """Keep tonal backgrounds as grayscale when they contain substantial detail."""
+    histogram = image.convert("L").histogram()
+    pixel_count = sum(histogram)
+    if pixel_count == 0:
+        raise ValueError("Нельзя классифицировать пустое изображение фона.")
+    tonal_pixels = sum(histogram[level] for level in _BACKGROUND_TONE_RANGE)
+    return tonal_pixels / pixel_count > _MAX_SIMPLE_BACKGROUND_TONE_FRACTION
 
 
 def parse_djvudump_output(

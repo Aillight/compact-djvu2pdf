@@ -10,6 +10,7 @@ from PIL import Image
 
 from core.inspector import (
     PageType,
+    background_requires_grayscale,
     classify_thumbnail,
     inspect_document,
     parse_djvudump_output,
@@ -59,9 +60,16 @@ class DjVuInspectionTests(unittest.TestCase):
                 """
                 import sys
                 from PIL import Image
-                Image.new("RGB", (150, 200), (128, 128, 128)).save(
-                    sys.argv[-1], format="PPM"
-                )
+                args = sys.argv
+                output = args[-1]
+                if "-mode=background" in args:
+                    Image.linear_gradient("L").resize((150, 200)).save(
+                        output, format="PPM"
+                    )
+                else:
+                    Image.new("RGB", (150, 200), (128, 128, 128)).save(
+                        output, format="PPM"
+                    )
                 """,
             )
             tools = ToolPaths(
@@ -78,6 +86,13 @@ class DjVuInspectionTests(unittest.TestCase):
         self.assertEqual(page.chunks[-1].name, "BG44")
         self.assertGreater(page.chunks[-1].size, 0)
         self.assertLess(page.mean_chroma, 1.0)
+
+    def test_background_classifier_keeps_photographic_tones_in_grayscale(self) -> None:
+        simple_paper = Image.new("L", (150, 200), 245)
+        detailed_background = Image.linear_gradient("L").resize((150, 200))
+
+        self.assertFalse(background_requires_grayscale(simple_paper))
+        self.assertTrue(background_requires_grayscale(detailed_background))
 
     def test_saturated_thumbnail_is_classified_as_color(self) -> None:
         page_type, mean_chroma, fraction = classify_thumbnail(

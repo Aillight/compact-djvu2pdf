@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from PIL import Image
+from PIL import ImageChops, ImageFilter, ImageMath
 
 from .assembler import PageImage, assemble_pdf
 from .inspector import PageInspection, PageType, inspect_document
@@ -26,7 +27,10 @@ ProgressCallback = Callable[[str, int], None]
 _DPI = 300
 _IMAGE_DPI = 150
 _JPEG_QUALITY = 75
-_BLACK_WHITE_THRESHOLD = 150
+_GRAYSCALE_JPEG_QUALITY = 35
+_ADAPTIVE_WINDOW_RADIUS = 15
+_ADAPTIVE_THRESHOLD_OFFSET = 8
+_PAPER_FLATNESS_TOLERANCE = 2
 _DEFAULT_CHUNK_SIZE = 50
 
 
@@ -105,10 +109,37 @@ def _render_size(page: PageInspection) -> tuple[int, int, int]:
 def _binarize_grayscale(source: Path, destination: Path) -> None:
     with Image.open(source) as image:
         grayscale = image.convert("L")
-        binary = grayscale.point(
-            lambda value: 255 if value >= _BLACK_WHITE_THRESHOLD else 0
+        local_mean = grayscale.filter(
+            ImageFilter.BoxBlur(_ADAPTIVE_WINDOW_RADIUS)
+        )
+        threshold = local_mean.point(
+            lambda value: max(0, value - _ADAPTIVE_THRESHOLD_OFFSET)
+        )
+        binary = ImageMath.lambda_eval(
+            lambda images: (images["grayscale"] >= images["threshold"]) * 255,
+            grayscale=grayscale,
+            threshold=threshold,
         ).convert("1")
         binary.save(destination, format="TIFF", compression="group4")
+
+
+def _normalize_grayscale_background(image: Image.Image) -> Image.Image:
+    """Whiten near-white flat paper while preserving bright image details."""
+    grayscale = image.convert("L")
+    local_range = ImageChops.subtract(
+        grayscale.filter(ImageFilter.MaxFilter(3)),
+        grayscale.filter(ImageFilter.MinFilter(3)),
+    )
+    near_white = grayscale.point(lambda value: 255 if value > 215 else 0)
+    flat_background = local_range.point(
+        lambda value: 255 if value <= _PAPER_FLATNESS_TOLERANCE else 0
+    )
+    paper_mask = ImageChops.multiply(near_white, flat_background)
+    return ImageChops.lighter(grayscale, paper_mask)
+
+
+def _has_foreground_mask(page: PageInspection) -> bool:
+    return any(chunk.name == "Sjbz" and chunk.size > 0 for chunk in page.chunks)
 
 
 def _jbig2_page_outputs(prefix: Path, expected_count: int) -> tuple[Path, ...]:
@@ -259,11 +290,10 @@ def convert(
                         component_pages[key] = page_index
                         component_pages[key.casefold()] = page_index
             outlines = _map_outline_pages(outlines, component_pages, page_count)
-        page_types = (
-            [inspection.page_type for inspection in inspections]
-            if profile is ConversionProfile.AUTO
-            else [PageType.MONOCHROME] * page_count
-        )
+        if profile is ConversionProfile.AUTO:
+            page_types = [inspection.page_type for inspection in inspections]
+        else:
+            page_types = [PageType.MONOCHROME] * page_count
         notify("Метаданные и оглавление извлечены.", 10)
 
         pages = parsed_pages if preserve_text else tuple(
@@ -287,8 +317,18 @@ def convert(
             ):
                 token.check()
                 is_monochrome = page_type is PageType.MONOCHROME
+                use_foreground_mask = (
+                    profile is ConversionProfile.AUTO
+                    and is_monochrome
+                    and _has_foreground_mask(inspection)
+                )
                 binarize_composite = (
                     profile is ConversionProfile.CLEAN_BLACK_AND_WHITE
+                    or (
+                        profile is ConversionProfile.AUTO
+                        and page_type is PageType.MONOCHROME
+                        and not use_foreground_mask
+                    )
                 )
                 output_format = (
                     "pgm"
@@ -302,15 +342,19 @@ def convert(
                 rendered_path = (
                     work_dir / f"page-{page_index:05d}-composite.pgm"
                     if binarize_composite
+                    else work_dir / f"page-{page_index:05d}-mask.tif"
+                    if use_foreground_mask
                     else raster_path
                 )
                 command = [
                     str(executables.ddjvu),
                     f"-format={output_format}",
                 ]
-                if is_monochrome and not binarize_composite:
+                if use_foreground_mask:
+                    command.append("-mode=mask")
+                elif is_monochrome and not binarize_composite:
                     command.append("-mode=black")
-                elif not binarize_composite:
+                if not is_monochrome and not binarize_composite:
                     width, height, rendered_dpi = _render_size(inspection)
                     if width > 0 and height > 0:
                         command.append(f"-size={width}x{height}")
@@ -328,6 +372,14 @@ def convert(
                 )
                 if binarize_composite:
                     _binarize_grayscale(rendered_path, raster_path)
+                    rendered_path.unlink()
+                elif use_foreground_mask:
+                    with Image.open(rendered_path) as image:
+                        image.convert("1").save(
+                            raster_path,
+                            format="TIFF",
+                            compression="group4",
+                        )
                     rendered_path.unlink()
                 if is_monochrome:
                     width, height = _tiff_dimensions(raster_path)
@@ -387,10 +439,19 @@ def convert(
                 )
                 jpeg_path = work_dir / f"page-{page_index + 1:05d}.jpg"
                 with Image.open(rendered_page.path) as image:
-                    image.convert("RGB" if encoding == "jpeg" else "L").save(
+                    encoded_image = (
+                        image.convert("RGB")
+                        if encoding == "jpeg"
+                        else _normalize_grayscale_background(image)
+                    )
+                    encoded_image.save(
                         jpeg_path,
                         format="JPEG",
-                        quality=_JPEG_QUALITY,
+                        quality=(
+                            _GRAYSCALE_JPEG_QUALITY
+                            if encoding == "jpeg-gray"
+                            else _JPEG_QUALITY
+                        ),
                         optimize=True,
                         **(
                             {"subsampling": "4:2:0"}
@@ -419,6 +480,11 @@ def convert(
             for chunk_index, chunk in enumerate(chunks):
                 token.check()
                 prefix = work_dir / f"jbig2-chunk-{chunk_index:04d}"
+                notify(
+                    f"Сжатие JBIG2: чанк {chunk_index + 1} из {len(chunks)} "
+                    f"({len(chunk)} стр.)...",
+                    50 + (35 * completed_steps // max(compression_steps, 1)),
+                )
                 command = [str(executables.jbig2)]
                 if use_symbol_dictionary:
                     command.append("-s")
@@ -450,7 +516,7 @@ def convert(
 
                 completed_steps += 1
                 notify(
-                    f"Сжатие JBIG2: чанк {chunk_index + 1} из {len(chunks)}...",
+                    f"JBIG2: чанк {chunk_index + 1} из {len(chunks)} готов.",
                     50 + (35 * completed_steps // max(compression_steps, 1)),
                 )
 

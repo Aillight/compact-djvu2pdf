@@ -140,7 +140,10 @@ class MainWindow(QMainWindow):
         profile_layout = QHBoxLayout()
         profile_label = QLabel("Профиль конвертации")
         self.profile_combo = QComboBox()
-        self.profile_combo.addItem("Авто", ConversionProfile.AUTO)
+        self.profile_combo.addItem(
+            "Авто (JBIG2 для простого фона)",
+            ConversionProfile.AUTO,
+        )
         self.profile_combo.addItem(
             "Чистый ч/б (JBIG2)",
             ConversionProfile.CLEAN_BLACK_AND_WHITE,
